@@ -3,154 +3,111 @@ import os
 import pandas as pd
 import numpy as np
 import torch
-from transformers import BertModel
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from utils.models import BertForSequenceClassification, XLMRobertaForSequenceClassification
-from transformers import RobertaForSequenceClassification
-from utils.models import bertCNN, bertDPCNN
 from utils.data_processor import convert_data_into_features
-from utils.models import BertForSequenceClassification
-from train import  show_performance
-import time 
-from torch import cuda
-device = 'cuda' if cuda.is_available() else 'cpu'
-
-MAX_LEN = 150
-BATCH_SIZE = 20
+from train import show_performance
+import glob
 
 
-def predict(model, data_loader):
+def predict(model, test_loader, device):
     model.eval()
+    preds = []
 
-    predictions = []
-
-    for _, data in enumerate(data_loader, 0):
+    for _, data in enumerate(test_loader):
         ids = data['ids'].to(device, dtype=torch.long)
-        mask = data['mask'].to(device, dtype=torch.long)
-        token_type_ids = data['token_type_ids'].to(device, dtype=torch.long)
 
         with torch.no_grad():
-            
-            outputs = model(ids, mask, token_type_ids)
-            big_val, big_idx = torch.max(outputs[0].data, dim=1)
-            predictions.extend(big_idx.tolist())
-    
-    return predictions
+            outputs = model(ids)
+            _, big_idx = torch.max(outputs[0].data, dim=1)
+            preds.extend(big_idx.tolist())
+
+    return preds
 
 
-def ensemble_model_pred(model_path_ls, df, label = True, merge = True):
-    """
-    run prediction for one model or a list of models, and ensemble the results
-    :param model_path_ls: a list of model path
-    :param df: data to be predicted
-    :return: predictions for each model and their ensemble results(majority vote)
-    """
-    pred = []
-    for path in model_path_ls:
-        print(path)
-        if path.startswith('bert'):
-            
-            pretrained_weights = 'fine_tune/finetuned_lm_180k'
+def ensemble_predict(df, model_paths, has_label):
+    num_labels = 3 if args.do_merge else 4
+
+    pred_all = []
+
+    for model_path in model_paths:
+        print(model_path)
+        if model_path.split('/')[-1].startswith('bert'):
+            weights = 'bert-base-multilingual-cased'
+        # elif model_path.split('/')[-1].startswith('xlm_'):
+        # weights = 'fine_tune/xlm-r_finetune_mlm_100k'
         else:
-            pretrained_weights = 'fine_tune/xlm-r_finetune_mlm_100k'
+            weights = 'xlm-roberta-base'
+        tokenizer = AutoTokenizer.from_pretrained(weights, do_lower_case=args.do_lower_case)
+        model = AutoModelForSequenceClassification.from_pretrained(weights, num_labels=num_labels).to(args.device)
+        model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')), strict=False)
 
-        tokenizer = AutoTokenizer.from_pretrained(pretrained_weights, do_lower_case=args.do_lower_case)
-          
-        
-        model =AutoModelForSequenceClassification.from_pretrained(pretrained_weights, num_labels=args.num_labels)
-       
-            
+        test_loader = convert_data_into_features(df, tokenizer, max_len=args.max_len, batch_size=args.batch_size,
+                                                 shuffle=False, has_label=args.has_label)
 
-        model.to(device)
-        model.load_state_dict(torch.load(args.model_dir+'/'+path, map_location=torch.device('cpu')))
-        data_loader = convert_data_into_features(df, tokenizer, max_len=MAX_LEN, batch_size=BATCH_SIZE, shuffle=False, label = label, merge = merge)
-        start = time.time()
-        predictions = predict(model, data_loader)
-        end = time.time()
-        print(f'processing time for one model is {end-start}')
-        pred.append(predictions)
+        preds = predict(model, test_loader, args.device)
+        if has_label:
+            f1_score_macro = show_performance(df.label, preds)
 
-    if len(pred) == 1:  # prediction for single model, no ensemble
-        return pred
+        pred_all.append(preds)
+
+    if len(pred_all) == 1:
+        return pred_all
+
     else:
-        # reverse row and colum
-        
-        pred = list(map(list, zip(*pred)))
-        # get mode for each row (every instance)
-        pred_ensemble = [np.argmax(np.bincount(x)) for x in pred]
-        
-        return pred, pred_ensemble
-
-
-def run(model_names, read_dir, write_dir, label = False, merge = True):
-    print(read_dir)
-    if label:
-        files = [f for f in os.listdir(read_dir) if f.endswith("dev.csv") or f.endswith("test.csv")]
-    else:
-        files = [f for f in os.listdir(read_dir) if f.endswith(".csv")]
-    print(files)
-    
-    for file in files:
-        f_name = os.path.join(read_dir,file)
-        print(f_name)
-        try:
-            df = pd.read_csv(f_name)
-        except:
-            df = pd.read_csv(f_name, lineterminator="\n")
-        print(df)
-        if len(model_names) == 1:
-            predictions = ensemble_model_pred(model_names, df, label)
-            print(len(df), len(predictions[0]))
-            df['predict'] = predictions[0]
-            df = df[['id', 'date', 'text','predict']]
-        else:
-           
-            predictions, predictions_ensemble = ensemble_model_pred(model_names, df, label, merge)
-            print(len(df), len(predictions_ensemble))
-            if label:
-                if 'test' in file:
-                    print('+++++++test+++++++')
-                if 'dev' in file: 
-                    print('+++++++evaluation+++++++')
-                f1_score_macro = show_performance(df.label, predictions_ensemble)
-            df['predict'] = [",".join(str(i) for i in x) for x in predictions]
-            df['predict_ensemble'] = predictions_ensemble
-            #df = df[['id', 'date','text','predict', 'predict_ensemble']]
-            
-           
-        print(df)
-
-        df.to_csv(os.path.join(write_dir, file), index=False)
+        pred_all = list(map(list, zip(*pred_all)))
+        pred_ensemble = [np.argmax(np.bincount(x)) for x in pred_all]
+        return pred_all, pred_ensemble
 
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument("--model_dir", type=str, required=True,default='saved_weights/', help="Directory which saves models")
-    parser.add_argument("--model_name", type=str, default=None, help="Name of the model, for single model prediction")
-    parser.add_argument("--data_dir", type=str, default='new_output',
-                        help="Directory which saves data to be predicted")
-    parser.add_argument("--output_dir", type=str, default='new_output/output', help="Path to save the prediction results")
-    parser.add_argument("--num_labels", type=int, default=3, help="The number of classes for classification")
-    parser.add_argument('--do_lower_case', action="store_true", help="Whether lowercase text before tokenization")
+    parser.add_argument("--file_path", type=str, required=True)
 
-    parser.add_argument('--label', type=bool, help="Whether we have labels, i.e. in a test mode, the datasets can be test/dev set")
-    parser.add_argument('--do_merge', type=bool, default = True, help="When we have labels and we want to merge class 2 and class 3")
-   
+    parser.add_argument("--pred_dir", type=str, default='predictions')
+
+    # parser.add_argument("--num_labels", type=int, default=3, help="The number of classes for classification")
+    parser.add_argument('--do_lower_case', action="store_true", help="Whether lowercase text before tokenization")
+    parser.add_argument('--has_label', action="store_true")
+    parser.add_argument('--do_merge', type=bool, default=True,
+                        help="When we have labels and we want to merge class 2 and class 3")
+    parser.add_argument("--max_len", type=int, default=150, help="Maximal sequence length of bert or xlm model")
+    parser.add_argument('--device', default='cuda')
+    parser.add_argument('--use_ensemble', action="store_true")
+    parser.add_argument('--model_dir', default='best_weights')
+    parser.add_argument('--model_name', default=None)
+    parser.add_argument("--batch_size", default=16, type=int, help="The batch size for training.")
+
     args = parser.parse_args()
-    print(f'data_dir={args.data_dir}, output_dir={args.output_dir}')
-    if args.model_name is not None:
-        model_path_ls = [args.model_name]
+
+    if args.use_ensemble:
+        model_paths = glob.glob(f'{args.model_dir}/*.bin')
     else:
-        model_path_ls = os.listdir(args.model_dir)
-    print(f'model paths: {model_path_ls}')
-   
-    for path in model_path_ls:
-        if path.startswith('xlm') or path.startswith('bert'):
-            
-            continue
-        else:
-            raise ValueError(
-                f'Error model name {path}! Model name must start with the following 4 types: bert, xlm, bert_cnn or bert_dpcnn')
-   
-    
-    run(model_path_ls, args.data_dir, args.output_dir, args.label, args.do_merge)
+        model_paths = [os.path.join(args.model_dir, args.model_name)]
+
+    try:
+        df = pd.read_csv(args.file_path)
+    except:
+        df = pd.read_csv(args.file_path, lineterminator="\n")
+    df['text'] = df['text'].replace(r'http\S+', '', regex=True).replace(r'www\S+', '', regex=True)
+    print(len(model_paths))
+
+    if len(model_paths) == 1:
+        pred = ensemble_predict(df, model_paths, args.has_label)
+        df['predict_ensemble'] = pred[0]
+
+    else:
+        pred_all, pred_ensemble = ensemble_predict(df, model_paths, args.has_label)
+        # df['predict'] = [",".join(str(i) for i in x) for x in pred_all]
+        df['predict_ensemble'] = pred_ensemble
+
+    if args.has_label:
+        f1_score_macro = show_performance(df.label, df.predict_ensemble)
+
+    if not os.path.exists(args.pred_dir):
+        os.mkdir(args.pred_dir)
+    df.to_csv(os.path.join(args.pred_dir, args.file_path.split('/')[-1]), index=False)
+
+
+
+
+
